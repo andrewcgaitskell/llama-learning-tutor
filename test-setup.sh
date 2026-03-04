@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Tutoring setup: Ollama + Llama 3.2 3B Instruct on Pi 5 with Podman ==="
+echo "=== Tutoring setup: Ollama + Llama 3.2 3B Instruct on Pi 5 (Podman) ==="
 
 # 1. Install Podman if missing
-if ! command -v podman &> /dev/null; then
+command -v podman >/dev/null 2>&1 || {
     echo "Installing Podman..."
     sudo apt update
     sudo apt install -y podman
-fi
+}
 
-# 2. Create persistent storage folders
-mkdir -p ~/ollama/models
-mkdir -p ~/ollama/config
+# 2. Persistent storage
+mkdir -p ~/ollama/models ~/ollama/config
 
-# 3. Create strong kid-tutor Modelfile
+# 3. Kid-tutor Modelfile (strong guiding style)
 cat > ~/ollama/config/Modelfile-kid-tutor << 'EOF'
 FROM llama3.2:3b-instruct
 
@@ -30,22 +29,17 @@ Rules you MUST follow every time:
 - If question is off-topic, unsafe, personal, or mean: reply "Let's keep it to fun science or maths — what's your question?"
 - Be super encouraging: say "Great try!", "You're doing brilliantly!", "We can figure this out together!"
 - End most replies with a question to check understanding.
+- Keep replies short (4-8 sentences max).
 """
 EOF
 
-echo "Custom Modelfile created."
+# 4. Build minimal image (fast, small)
+podman build -t ollama-tutor-pi -f DockerfileBase .
 
-# 4. Build the image (only once or when updating Ollama base)
-echo "Building Ollama image with Llama 3.2 3B Instruct..."
-podman build -t ollama-tutor-pi -f Dockerfile .
+# 5. (Re)start container
+podman stop ollama-tutor >/dev/null 2>&1 || true
+podman rm ollama-tutor >/dev/null 2>&1 || true
 
-# 5. Run the container (persistent, rootless, localhost-only)
-if podman ps -q -f name=ollama-tutor > /dev/null; then
-    echo "Stopping old container..."
-    podman stop ollama-tutor && podman rm ollama-tutor
-fi
-
-echo "Starting tutoring container..."
 podman run -d \
     --name ollama-tutor \
     -v ~/ollama/models:/root/.ollama \
@@ -55,50 +49,36 @@ podman run -d \
     --tmpfs /tmp:size=256m \
     ollama-tutor-pi
 
-# Wait for startup
-sleep 10
+echo "Waiting for Ollama server to start (20-40 seconds)..."
+sleep 30
 
-# 6. Create the custom tutor model inside the container
-echo "Creating custom 'kid-tutor' model..."
+# 6. Pull model at runtime (only once; survives restarts via volume)
+echo "Pulling llama3.2:3b-instruct (2-5 min depending on network)..."
+podman exec ollama-tutor ollama pull llama3.2:3b-instruct
+
+# 7. Create custom tutor model
 podman cp ~/ollama/config/Modelfile-kid-tutor ollama-tutor:/tmp/Modelfile-kid-tutor
 podman exec ollama-tutor ollama create kid-tutor -f /tmp/Modelfile-kid-tutor
 
 echo ""
-echo "Tutoring setup ready!"
+echo "Setup finished!"
 echo ""
-echo "=== How to use ==="
-echo "Interactive chat (best for testing):"
+echo "Interactive chat:"
 echo "  podman exec -it ollama-tutor ollama run kid-tutor"
 echo ""
-echo "One-shot API test from your Pi terminal:"
-echo "  curl http://127.0.0.1:11434/api/chat -d '{\"model\":\"kid-tutor\",\"messages\":[{\"role\":\"user\",\"content\":\"How do I add 1/4 and 1/2?\"}],\"stream\":false}' | jq -r '.message.content'"
+echo "Quick API test:"
+echo "  curl http://127.0.0.1:11434/api/chat -d '{\"model\":\"kid-tutor\",\"messages\":[{\"role\":\"user\",\"content\":\"Why does a ball fall down when I drop it?\"}],\"stream\":false}' | jq -r '.message.content'"
 echo ""
 
-# 7. Quick automated tests with sample prompts
-echo "Running 5 test prompts for tutoring quality..."
-
-TEST_PROMPTS=(
-    "How do I add 1/4 and 1/2?"
-    "Why does a ball fall down when I drop it?"
-    "Solve this: 3x + 7 = 19"
-    "What is the difference between ice, water and steam?"
+# Optional: 3 test prompts
+for prompt in \
+    "How do I add 1/4 and 1/2?" \
+    "Solve this: 3x + 7 = 19" \
     "I don't understand why we multiply when finding area. I'm stupid."
-)
-
-for prompt in "${TEST_PROMPTS[@]}"; do
+do
+    echo "Test: $prompt"
+    echo "----------------------------------------"
+    curl -s http://127.0.0.1:11434/api/chat -d "{\"model\":\"kid-tutor\",\"messages\":[{\"role\":\"user\",\"content\":\"$prompt\"}],\"stream\":false}" | jq -r '.message.content // "Error"'
+    echo "----------------------------------------"
     echo ""
-    echo "Test prompt: $prompt"
-    echo "----------------------------------------"
-    RESPONSE=$(curl -s http://127.0.0.1:11434/api/chat -d '{
-      "model": "kid-tutor",
-      "messages": [{"role": "user", "content": "'"$prompt"'"}],
-      "stream": false
-    }' | jq -r '.message.content // .error // "No response"')
-    echo "$RESPONSE"
-    echo "----------------------------------------"
 done
-
-echo ""
-echo "Done! Review the responses above — they should be simple, guiding, encouraging, and safe."
-echo "If happy, integrate the API[](http://127.0.0.1:11434) into your Python tutoring portal."
-
