@@ -1,21 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Tutoring setup: Ollama + Llama 3.2 3B Instruct on Pi 5 (Podman) ==="
+echo "=== Tutoring setup: Llama-3.2-3B-Instruct (GGUF) on Pi 5 with Podman ==="
 
-# 1. Install Podman if missing
+# 1. Install Podman + tools if missing
 command -v podman >/dev/null 2>&1 || {
     echo "Installing Podman..."
     sudo apt update
-    sudo apt install -y podman
+    sudo apt install -y podman wget curl jq
 }
 
 # 2. Persistent storage
-mkdir -p ~/ollama/models ~/ollama/config
+mkdir -p ~/ollama/models/blobs ~/ollama/config
 
-# 3. Kid-tutor Modelfile (strong guiding style)
-cat > ~/ollama/config/Modelfile-kid-tutor << 'EOF'
-FROM llama3.2:3b-instruct
+# 3. Download GGUF file if not already present (Q5_K_M recommended for Pi 5)
+GGUF_FILE="Llama-3.2-3B-Instruct-Q5_K_M.gguf"
+GGUF_PATH="$HOME/ollama/models/blobs/$GGUF_FILE"
+
+if [ ! -f "$GGUF_PATH" ]; then
+    echo "Downloading Llama-3.2-3B-Instruct-Q5_K_M.gguf (~2.3 GB)..."
+    wget -O "$GGUF_PATH" "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/$GGUF_FILE"
+else
+    echo "GGUF file already downloaded."
+fi
+
+# 4. Kid-tutor Modelfile (references the local GGUF file)
+cat > ~/ollama/config/Modelfile-kid-tutor << EOF
+FROM $GGUF_PATH
 
 SYSTEM """
 You are "Science & Maths Buddy", a kind, patient, fun tutor ONLY for children up to 14 years old.
@@ -33,10 +44,14 @@ Rules you MUST follow every time:
 """
 EOF
 
-# 4. Build minimal image (fast, small)
-podman build -t ollama-tutor-pi -f DockerfileBase .
+# 5. Build minimal Ollama image (fast)
+podman build -t ollama-tutor-pi - << 'EOF'
+FROM docker.io/ollama/ollama:latest
+EXPOSE 11434
+CMD ["serve"]
+EOF
 
-# 5. (Re)start container
+# 6. (Re)start container
 podman stop ollama-tutor >/dev/null 2>&1 || true
 podman rm ollama-tutor >/dev/null 2>&1 || true
 
@@ -49,36 +64,51 @@ podman run -d \
     --tmpfs /tmp:size=256m \
     ollama-tutor-pi
 
-echo "Waiting for Ollama server to start (20-40 seconds)..."
+echo "Waiting for Ollama server to start (30 seconds)..."
 sleep 30
 
-# 6. Pull model at runtime (only once; survives restarts via volume)
-echo "Pulling llama3.2:3b-instruct (2-5 min depending on network)..."
-podman exec ollama-tutor ollama pull llama3.2:3b-instruct
-
-# 7. Create custom tutor model
+# 7. Create the custom kid-tutor model from GGUF + Modelfile
+echo "Creating custom 'kid-tutor' model from GGUF..."
 podman cp ~/ollama/config/Modelfile-kid-tutor ollama-tutor:/tmp/Modelfile-kid-tutor
 podman exec ollama-tutor ollama create kid-tutor -f /tmp/Modelfile-kid-tutor
 
 echo ""
-echo "Setup finished!"
+echo "Setup finished! Model 'kid-tutor' is ready."
 echo ""
+echo "=== How to use ==="
 echo "Interactive chat:"
 echo "  podman exec -it ollama-tutor ollama run kid-tutor"
 echo ""
-echo "Quick API test:"
-echo "  curl http://127.0.0.1:11434/api/chat -d '{\"model\":\"kid-tutor\",\"messages\":[{\"role\":\"user\",\"content\":\"Why does a ball fall down when I drop it?\"}],\"stream\":false}' | jq -r '.message.content'"
+echo "One-shot API test:"
+echo "  curl http://127.0.0.1:11434/api/chat -d '{\"model\":\"kid-tutor\",\"messages\":[{\"role\":\"user\",\"content\":\"How do I add 1/4 and 1/2?\"}],\"stream\":false}' | jq -r '.message.content'"
 echo ""
 
-# Optional: 3 test prompts
-for prompt in \
-    "How do I add 1/4 and 1/2?" \
-    "Solve this: 3x + 7 = 19" \
+# 8. Run quick tests
+echo "Running 5 test prompts..."
+
+TEST_PROMPTS=(
+    "How do I add 1/4 and 1/2?"
+    "Why does a ball fall down when I drop it?"
+    "Solve this: 3x + 7 = 19"
+    "What is the difference between ice, water and steam?"
     "I don't understand why we multiply when finding area. I'm stupid."
-do
+)
+
+for prompt in "${TEST_PROMPTS[@]}"; do
+    echo ""
     echo "Test: $prompt"
     echo "----------------------------------------"
-    curl -s http://127.0.0.1:11434/api/chat -d "{\"model\":\"kid-tutor\",\"messages\":[{\"role\":\"user\",\"content\":\"$prompt\"}],\"stream\":false}" | jq -r '.message.content // "Error"'
+    RESPONSE=$(curl -s http://127.0.0.1:11434/api/chat -d '{
+      "model": "kid-tutor",
+      "messages": [{"role": "user", "content": "'"$prompt"'"}],
+      "stream": false
+    }' | jq -r '.message.content // .error // "No response"')
+    echo "$RESPONSE"
     echo "----------------------------------------"
-    echo ""
 done
+
+echo ""
+echo "Done. If tests look good, integrate http://127.0.0.1:11434/api/chat into your Python portal."
+echo "To change quantization (e.g., faster Q4_K_M or better Q6_K), download another GGUF from:"
+echo "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF"
+
