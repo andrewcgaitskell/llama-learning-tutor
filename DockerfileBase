@@ -1,0 +1,8 @@
+# Official Ollama image – fully supports ARM64 / Raspberry Pi 5
+FROM docker.io/ollama/ollama:latest
+
+# Expose the API port
+EXPOSE 11434
+
+# Default: start Ollama server
+CMD ["serve"]
